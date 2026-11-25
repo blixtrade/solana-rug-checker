@@ -123,3 +123,107 @@ test("creator share comes from the holder list when RugCheck's creatorBalance is
   assert.match(titles(assess(d)), /Creator is not a top holder/);
   assert.doesNotMatch(titles(assess(d)), /Creator holds 0%/);
 });
+
+// Issue #7: one small test per untested assess() branch, each from safe().
+const NOW = 1_800_000_000_000; // fixed "now" so the age tests are deterministic
+
+test("transfer hook and non-transferable extensions are flagged", () => {
+  const d = safe();
+  d.mintInfo.extensions = [
+    { extension: "transferHook", state: {} },
+    { extension: "nonTransferable", state: {} },
+  ];
+  const r = assess(d);
+  assert.equal(r.score, 50);
+  assert.ok(r.findings.some((f) => f.title === "Transfer hook" && f.level === "warn" && f.points === 10));
+  assert.ok(r.findings.some((f) => f.title === "Non-transferable" && f.level === "danger" && f.points === 40));
+});
+
+test("default account state counts only when frozen", () => {
+  const d = safe();
+  d.mintInfo.extensions = [{ extension: "defaultAccountState", state: { accountState: "frozen" } }];
+  const r = assess(d);
+  assert.equal(r.score, 15);
+  assert.match(titles(r), /Default account state/);
+
+  const e = safe();
+  e.mintInfo.extensions = [{ extension: "defaultAccountState", state: { accountState: "initialized" } }];
+  assert.equal(assess(e).score, 0);
+  assert.doesNotMatch(titles(assess(e)), /Default account state/);
+});
+
+test("transfer tax under 5% is a warning, not a danger", () => {
+  const d = safe();
+  d.mintInfo.extensions = [{ extension: "transferFeeConfig", state: { newerTransferFee: { transferFeeBasisPoints: 200 } } }];
+  const r = assess(d);
+  assert.equal(r.score, 10);
+  assert.ok(r.findings.some((f) => f.title === "Transfer tax 2.00%" && f.level === "warn" && f.points === 10));
+});
+
+test("insider points are capped at 15", () => {
+  const d = safe();
+  d.report.topHolders = holders([2, 2, 1, 1, 1, 1]).map((h) => ({ ...h, insider: true }));
+  const r = assess(d);
+  // 6 insiders would be 18 points uncapped; the cap holds it at 15.
+  assert.ok(r.findings.some((f) => f.title === "6 top holders flagged as insiders" && f.level === "warn" && f.points === 15));
+  assert.equal(r.score, 15);
+});
+
+test("creator share above 5% warns, between 0 and 5% is ok", () => {
+  const d = safe();
+  d.report.creatorBalance = 80000; // 8% of the 1,000,000 supply
+  const r = assess(d);
+  assert.equal(r.score, 8);
+  assert.ok(r.findings.some((f) => f.title === "Creator holds 8.0%" && f.level === "warn" && f.points === 8));
+
+  const e = safe();
+  e.report.creatorBalance = 30000; // 3%
+  const s = assess(e);
+  assert.equal(s.score, 0);
+  assert.ok(s.findings.some((f) => f.title === "Creator holds 3.00%" && f.level === "ok" && f.points === 0));
+});
+
+test("a pump.fun curve coin under an hour old adds 5", () => {
+  const d = safe();
+  d.pair = { dexId: "pumpfun", pairCreatedAt: NOW - 1800_000, txns: { h24: { buys: 3, sells: 1 } } };
+  const r = assess({ ...d, now: NOW });
+  assert.equal(r.score, 13); // 8 for the bonding curve, 5 for being under an hour old
+  assert.match(titles(r), /Launched under an hour ago/);
+});
+
+test("a pool under an hour old adds 5", () => {
+  const d = safe();
+  d.pair.pairCreatedAt = NOW - 1800_000;
+  const r = assess({ ...d, now: NOW });
+  assert.equal(r.score, 5);
+  assert.match(titles(r), /Pool is under an hour old/);
+});
+
+test("a RugCheck insider network is flagged", () => {
+  const d = safe();
+  d.report.graphInsidersDetected = 4;
+  const r = assess(d);
+  assert.equal(r.score, 5);
+  assert.match(titles(r), /Insider network of 4 wallets/);
+});
+
+test("findings are sorted danger, then warn, then ok, by points within each level", () => {
+  const d = safe();
+  d.mintInfo.extensions = [
+    { extension: "transferHook", state: {} },
+    { extension: "defaultAccountState", state: { accountState: "frozen" } },
+    { extension: "nonTransferable", state: {} },
+    { extension: "transferFeeConfig", state: { newerTransferFee: { transferFeeBasisPoints: 1000 } } },
+  ];
+  const r = assess(d);
+  assert.equal(r.score, 95);
+  const ranked = r.findings.filter((f) => f.points > 0).map((f) => `${f.level}:${f.points}:${f.title}`);
+  assert.deepEqual(ranked, [
+    "danger:40:Non-transferable",
+    "danger:30:Transfer tax 10.00%",
+    "warn:15:Default account state",
+    "warn:10:Transfer hook",
+  ]);
+  assert.equal(r.findings[0].level, "danger");
+  assert.equal(r.findings.at(-1).level, "ok");
+});
